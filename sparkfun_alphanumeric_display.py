@@ -1,6 +1,9 @@
 from adafruit_bus_device import i2c_device
+from micropython import const
+import time
 
 SEGMENTS = [
+    # NMLKJIHGFEDCBA
     0b00000000000000, # ' ' (space)
     0b00001000001000, # '!'
     0b00001000000010, # '"'
@@ -99,49 +102,53 @@ SEGMENTS = [
     0b11111111111111, # Unknown character (DEL or RUBOUT)
 ]
 
-ALPHA_BLINK_RATE_NOBLINK = 0b00
-ALPHA_BLINK_RATE_2HZ = 0b01
-ALPHA_BLINK_RATE_1HZ = 0b10
-ALPHA_BLINK_RATE_0_5HZ = 0b11
+BLINK_RATE_NOBLINK = 0b00
+BLINK_RATE_2HZ = 0b01
+BLINK_RATE_1HZ = 0b10
+BLINK_RATE_0_5HZ = 0b11
 
-ALPHA_CMD_SYSTEM_SETUP = 0b00100000
-ALPHA_CMD_DISPLAY_SETUP = 0b10000000
-ALPHA_CMD_DIMMING_SETUP = 0b11100000
-
-ALPHA_DISPLAY_ON = 0b1
-ALPHA_DISPLAY_OFF = 0b0
-
-ENABLE_SYS_CLOCK = ALPHA_CMD_SYSTEM_SETUP | 1
+_CMD_DISPLAY_SETUP = const(0b10000000)
+_CMD_DIMMING_SETUP = const(0b11100000)
+_CMD_SYSTEM_SETUP = const(0b00100000)
+_ENABLE_SYS_CLOCK = const(_CMD_SYSTEM_SETUP | 1)
 
 """
-//  S: semicolon
-//  P: dot
-//
-//      A
-//     ---
-//  F |IJK| B
-//    -GH--
-//  E |LMN| C
-//     ---
-//      D
+The first digit is encoded in the first bit of each nymble used
+The second is encoded in the recond bit, etc.
+
+S: semicolon
+P: dot
+
+      A
+     ---
+  F |IJK| B
+    -G-H-
+  E |NML| C
+     ---
+      D
+
+#  HA    _S    IB    _P    JC    __    KD    __
+ 0x11, 0x01, 0x11, 0x01, 0x11, 0x00, 0x11, 0x11,
+#  LE    __    MF    __    NG    __    __    __
+ 0x11, 0x00, 0x11, 0x00, 0x11, 0x00, 0x00, 0x00,
 """
-buffer0 = bytearray(
-    #  HA    _S    IB    _P    JC    __    KD    __
-    [0x11, 0x01, 0x11, 0x01, 0x11, 0x00, 0x11, 0x11]+
-    #  NE    __    MF    __    LG    __    __    __
-    [0x11, 0x00, 0x11, 0x00, 0x11, 0x00, 0x00, 0x00]
-)
 
 class SparkFunQwiicDisplay:
-    def __init__(self, i2c, address=0x70, brightness=0xF):
-        self.device = i2c_device.I2CDevice(i2c, address)
+    def __init__(self, i2c, address=0x70, brightness=0xF, auto_write=True):
+        if isinstance(address, int):
+            address = [address]
+        self.devices = []
+        for addr in address:
+            self.devices.append(i2c_device.I2CDevice(i2c, addr))
+        self.auto_write = auto_write
         self._duty = 15
-        self._blink_rate = ALPHA_BLINK_RATE_NOBLINK
+        self._blink_rate = BLINK_RATE_NOBLINK
         self._duty = brightness & 0xF
         self._display_on = True
-        self._colon = False
-        self._dot = False
+        self._colon = 0
+        self._dot = 0
         self._text = ""
+        self._buffer = bytearray(17)
         self.setup()
 
     @property
@@ -164,6 +171,7 @@ class SparkFunQwiicDisplay:
 
     @property
     def blink_rate(self):
+        """A value from 0 to 3. From no blink to the faster blink rate."""
         return self._blink_rate
 
     @blink_rate.setter
@@ -172,54 +180,72 @@ class SparkFunQwiicDisplay:
         if blink_rate:
             self._blink_rate = 0b100 - blink_rate
         else:
-            self._blink_rate = ALPHA_BLINK_RATE_NOBLINK
+            self._blink_rate = BLINK_RATE_NOBLINK
         self.setup()
 
     @property
     def colon(self):
+        """
+        Bitmask of which displays have a semicolon.
+        Use  1 << devnum. One display, show colon: 1.
+        Three displays, colon on the last one: 0b100.
+        """
         return self._colon
 
     @colon.setter
-    def colon(self, on):
-        self._colon = bool(on)
-        self.refresh()
+    def colon(self, value:int):
+        self._colon = value
+        self.show()
 
     @property
     def dot(self):
+        """
+        Bitmask of which displays have a dot.
+        Use  1 << devnum. One display, show dot: 1.
+        Three displays, dot on the last one: 0b100.
+        """
         return self._dot
 
     @dot.setter
-    def dot(self, on):
-        self._dot = bool(on)
-        self.refresh()
+    def dot(self, value:int):
+        self._dot = value
+        self.show()
 
     def setup(self):
-        with self.device as bus:
-            bus.write(bytes([ENABLE_SYS_CLOCK]))
-            bus.write(bytes([ALPHA_CMD_DIMMING_SETUP | (self._duty & 0xF)]))
-            command = (
-                ALPHA_CMD_DISPLAY_SETUP
-                | (self._blink_rate << 1)
-                | int(self._display_on)
-            )
-            bus.write(bytes([command]))
+        """Setup the display, brightness and blink base on current config."""
+        for device in self.devices:
+            with device as bus:
+                bus.write(bytes([_ENABLE_SYS_CLOCK]))
+                bus.write(bytes([_CMD_DIMMING_SETUP | (self._duty & 0xF)]))
+                command = (
+                    _CMD_DISPLAY_SETUP
+                    | (self._blink_rate << 1)
+                    | int(self._display_on)
+                )
+                bus.write(bytes([command]))
 
-    def refresh(self):
-        self.print(self._text)
+    def show(self):
+        """Update the display with the current text."""
+        buffer = self._buffer
+        for devnum, device in enumerate(self.devices):
+            # erase the character buffer
+            for i in range(7):
+                buffer[2 * i + 1] = 0
+            # set bits for each character
+            for pos, char in enumerate(self._text[devnum * 4:devnum * 4 + 4]):
+                segment = SEGMENTS[ord(char) - ord(" ")]
+                for i in range(7):
+                    digit = (segment >> i) & 1
+                    digit |= ((segment >> (i + 7)) & 1) << 4
+                    buffer[1 + i * 2] |= digit * (1 << pos)
+            buffer[2] = (self._colon >> devnum) & 1
+            buffer[4] = (self._dot >> devnum) & 1
+            #
+            with device as bus:
+                bus.write(buffer)
 
     def print(self, text):
+        """Print the string to the display from left to right."""
         self._text = text
-        buffer = bytearray(16)
-        for pos, char in enumerate(text[:4]):
-            segment = SEGMENTS[ord(char) - ord(" ")]
-            for i in range(7):
-                digit = (segment >> i) & 1
-                digit |= ((segment >> (i + 7)) & 1) << 4
-                buffer[i * 2] |= digit * (1 << pos)
-            if pos == 0:
-                if self._colon:
-                    buffer[1] |= 1
-                if self._dot:
-                    buffer[3] |= 1
-        with self.device as bus:
-            bus.write(b"\x00" + bytes(buffer))
+        if self.auto_write:
+            self.show()
